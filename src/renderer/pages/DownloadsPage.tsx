@@ -13,6 +13,7 @@ import {
   IconLoader,
   IconInfoCircle,
   IconRefresh,
+  IconPlayerStop,
 } from '@tabler/icons-react';
 import { useDownloadStore } from '../stores/download-store';
 import { StatusBadge } from '../components/StatusBadge';
@@ -289,6 +290,7 @@ function DownloadRow({ task }: { task: DownloadTask }) {
           appId={task.appId}
           appName={task.appName}
           gameDir={task.outputDirectory || ''}
+          onlineMode={task.onlineMode}
           onClose={() => setLaunchOpen(false)}
         />
       )}
@@ -309,8 +311,13 @@ function SteamWaitingBanner({
 }) {
   const [elapsed, setElapsed] = useState(0);
   const [repairing, setRepairing] = useState(false);
+  const [stoppingSteam, setStoppingSteam] = useState(false);
+  const [steamLogs, setSteamLogs] = useState<string[]>([]);
+  const [showLogs, setShowLogs] = useState(false);
   const startRef = useRef(Date.now());
+  const logEndRef = useRef<HTMLPreElement>(null);
 
+  // Timer
   useEffect(() => {
     const interval = setInterval(() => {
       setElapsed(Math.floor((Date.now() - startRef.current) / 1000));
@@ -318,23 +325,57 @@ function SteamWaitingBanner({
     return () => clearInterval(interval);
   }, []);
 
+  // Listen for Steam log lines from main process
+  useEffect(() => {
+    const unsub = window.electronAPI.on(IPC.STEAM_LOG, (data: any) => {
+      const line = data?.line || String(data);
+      setSteamLogs(prev => {
+        const next = [...prev, line];
+        return next.length > 200 ? next.slice(-200) : next;
+      });
+    });
+    return unsub;
+  }, []);
+
+  // Auto-scroll log
+  useEffect(() => {
+    logEndRef.current?.scrollTo({ top: logEndRef.current.scrollHeight });
+  }, [steamLogs]);
+
   const formatElapsed = (s: number) => {
     const m = Math.floor(s / 60);
     const sec = s % 60;
     return m > 0 ? `${m}m ${sec}s` : `${sec}s`;
   };
 
+  const lastLogLine = steamLogs.length > 0 ? steamLogs[steamLogs.length - 1] : null;
+
   const handleRepair = async () => {
     setRepairing(true);
+    setSteamLogs([]);
     try {
       const result = await window.electronAPI.invoke(IPC.REPAIR_STEAM_IN_PREFIX, appId) as any;
       if (result.success) {
         onRepairComplete();
       }
     } catch {
-      // repair failed silently — user can retry
+      // repair failed — user can retry
     } finally {
       setRepairing(false);
+    }
+  };
+
+  const handleStopSteam = async () => {
+    setStoppingSteam(true);
+    try {
+      await window.electronAPI.invoke(IPC.SHUTDOWN_STEAM_IN_PREFIX, appId);
+      // Give Steam a moment to finish its shutdown sequence
+      setTimeout(() => {
+        setStoppingSteam(false);
+        onCancel();
+      }, 3000);
+    } catch {
+      setStoppingSteam(false);
     }
   };
 
@@ -342,12 +383,17 @@ function SteamWaitingBanner({
     <div className="mt-3 px-3 py-3 bg-accent/5 rounded-lg border border-accent/10">
       <div className="flex items-start gap-2 mb-2">
         <IconBrandSteam size={16} stroke={1.5} className="text-accent mt-0.5 shrink-0" />
-        <div className="flex-1">
+        <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
             <p className="text-[13px] text-txt-primary font-medium">Steam is starting</p>
             <span className="text-[11px] text-txt-tertiary font-mono">{formatElapsed(elapsed)}</span>
             <IconLoader size={12} stroke={1.5} className="text-accent animate-spin" />
           </div>
+
+          {/* Latest status line */}
+          {lastLogLine && (
+            <p className="text-[11px] text-txt-secondary font-mono mt-1 truncate">{lastLogLine}</p>
+          )}
 
           <p className="text-[11px] text-txt-tertiary mt-1 leading-relaxed">
             A Steam window should appear. Log in with the account that owns this game.
@@ -355,6 +401,7 @@ function SteamWaitingBanner({
           </p>
           <p className="text-[11px] text-txt-tertiary mt-1 leading-relaxed">
             Once you're logged in and can see your library, click "Launch Game" below.
+            Keep Steam open while playing — it provides authentication for online multiplayer.
           </p>
 
           {elapsed > 120 && (
@@ -366,12 +413,40 @@ function SteamWaitingBanner({
         </div>
       </div>
 
+      {/* Expandable Steam log output */}
+      {steamLogs.length > 0 && (
+        <div className="mt-2">
+          <button
+            onClick={() => setShowLogs(!showLogs)}
+            className="flex items-center gap-1 text-[11px] text-txt-tertiary hover:text-txt-secondary transition-colors"
+          >
+            <IconTerminal2 size={12} stroke={1.5} />
+            {showLogs ? <IconChevronDown size={11} /> : <IconChevronRight size={11} />}
+            Steam Output ({steamLogs.length} lines)
+          </button>
+          {showLogs && (
+            <pre
+              ref={logEndRef}
+              className="mt-1.5 p-2 bg-black/30 text-txt-tertiary text-[10px] leading-relaxed font-mono
+                         rounded-md max-h-32 overflow-y-auto select-text whitespace-pre-wrap border border-border"
+            >
+              {steamLogs.join('\n')}
+            </pre>
+          )}
+        </div>
+      )}
+
       <div className="flex gap-2 mt-3">
         <button
-          onClick={onCancel}
-          className="px-3 py-1.5 text-xs text-txt-secondary rounded-md bg-white/5 hover:bg-white/10 transition-colors"
+          onClick={handleStopSteam}
+          disabled={stoppingSteam}
+          className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-txt-secondary rounded-md
+                     bg-white/5 hover:bg-white/10 disabled:opacity-40 transition-colors"
         >
-          Cancel
+          {stoppingSteam
+            ? <IconLoader size={13} stroke={1.5} className="animate-spin" />
+            : <IconPlayerStop size={13} stroke={1.5} />}
+          {stoppingSteam ? 'Stopping...' : 'Stop Steam'}
         </button>
         <button
           onClick={handleRepair}

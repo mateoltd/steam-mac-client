@@ -11,6 +11,7 @@ interface DownloadState {
   submitAuthCode: (taskId: string, code: string) => void;
   revealInFinder: (dir: string) => void;
   toggleOnlineMode: (taskId: string) => void;
+  loadExistingDownloads: () => Promise<void>;
 
   // Called by IPC listeners
   updateProgress: (taskId: string, percent: number) => void;
@@ -23,6 +24,28 @@ interface DownloadState {
 export const useDownloadStore = create<DownloadState>((set, get) => ({
   tasks: [],
   activePrompt: null,
+
+  loadExistingDownloads: async () => {
+    const existing = await window.electronAPI.invoke(IPC.SCAN_DOWNLOADS) as
+      { appId: number; appName: string; directory: string }[];
+    if (!existing?.length) return;
+    const tasks: DownloadTask[] = existing.map((e) => ({
+      id: crypto.randomUUID(),
+      appId: e.appId,
+      appName: e.appName,
+      depotId: '',
+      status: { type: 'completed' as const, outputDirectory: e.directory },
+      progressPercent: 100,
+      outputLog: '',
+      outputDirectory: e.directory,
+      onlineMode: true,
+    }));
+    set((s) => {
+      const existingAppIds = new Set(s.tasks.map(t => t.appId));
+      const newTasks = tasks.filter(t => !existingAppIds.has(t.appId));
+      return { tasks: [...s.tasks, ...newTasks] };
+    });
+  },
 
   startDownload: async (appId, appName, depotId, username, password) => {
     const taskId = crypto.randomUUID();

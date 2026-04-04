@@ -10,13 +10,16 @@ import { useDownloadStore } from './stores/download-store';
 import { IPC } from '../shared/ipc-channels';
 
 export default function App() {
-  const { sidebarItem, toolStatus, loadToolStatus, loadArchitecture } = useAppStore();
+  const { sidebarItem, toolStatus, loadToolStatus, loadArchitecture, loadSavedCredentials } = useAppStore();
+  const loadExistingDownloads = useDownloadStore((s) => s.loadExistingDownloads);
   const [showSetup, setShowSetup] = useState(false);
   const [checkedTools, setCheckedTools] = useState(false);
 
   useEffect(() => {
     loadToolStatus().then(() => setCheckedTools(true));
     loadArchitecture();
+    loadSavedCredentials();
+    loadExistingDownloads();
   }, []);
 
   // Auto-show setup wizard when tools are missing on first load

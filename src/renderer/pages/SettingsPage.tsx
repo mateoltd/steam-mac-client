@@ -111,7 +111,7 @@ export function SettingsPage() {
                              placeholder:text-txt-tertiary focus:outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/30 transition"
                 />
               </div>
-              <p className="text-[11px] text-txt-tertiary">Stored in memory only. Cleared on quit.</p>
+              <p className="text-[11px] text-txt-tertiary">Encrypted and saved locally.</p>
             </div>
           </section>
 
@@ -186,6 +186,24 @@ export function SettingsPage() {
               path={toolStatus?.gptkPath ?? null}
               onInstall={() => handleInstallSingle('gptk')}
               installing={installingSingle === 'gptk'}
+            />
+            <ToolCheckRow
+              label="Wine Crossover (recommended)"
+              path={toolStatus?.wineCrossoverPath ?? null}
+              onInstall={() => handleInstallSingle('wine-crossover')}
+              installing={installingSingle === 'wine-crossover'}
+            />
+            <ToolCheckRow
+              label="Wine Staging (fallback)"
+              path={toolStatus?.wineStagingPath ?? null}
+              onInstall={() => handleInstallSingle('wine-staging')}
+              installing={installingSingle === 'wine-staging'}
+            />
+            <ToolCheckRow
+              label="DXVK (D3D → Vulkan)"
+              path={toolStatus?.dxvkPath ?? null}
+              onInstall={() => handleInstallSingle('dxvk')}
+              installing={installingSingle === 'dxvk'}
             />
           </div>
 

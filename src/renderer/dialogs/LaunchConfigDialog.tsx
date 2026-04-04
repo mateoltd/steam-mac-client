@@ -15,10 +15,11 @@ interface Props {
   appId: number;
   appName: string;
   gameDir: string;
+  onlineMode: boolean;
   onClose: () => void;
 }
 
-export function LaunchConfigDialog({ open, appId, appName, gameDir, onClose }: Props) {
+export function LaunchConfigDialog({ open, appId, appName, gameDir, onlineMode, onClose }: Props) {
   const [exes, setExes] = useState<string[]>([]);
   const [selectedExe, setSelectedExe] = useState('');
   const [windowsVersion, setWindowsVersion] = useState<WindowsVersion>('win10');
@@ -30,6 +31,7 @@ export function LaunchConfigDialog({ open, appId, appName, gameDir, onClose }: P
   const [launching, setLaunching] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [loadingExes, setLoadingExes] = useState(false);
+  const [steamRunning, setSteamRunning] = useState<boolean | null>(null);
 
   useEffect(() => {
     if (!open || !gameDir) return;
@@ -42,6 +44,22 @@ export function LaunchConfigDialog({ open, appId, appName, gameDir, onClose }: P
       setLoadingExes(false);
     });
   }, [open, gameDir]);
+
+  // Check if Steam is running when in online mode
+  useEffect(() => {
+    if (!open || !onlineMode) {
+      setSteamRunning(null);
+      return;
+    }
+    const check = () => {
+      window.electronAPI.invoke(IPC.IS_STEAM_RUNNING, appId).then((running: any) => {
+        setSteamRunning(running as boolean);
+      });
+    };
+    check();
+    const interval = setInterval(check, 5000);
+    return () => clearInterval(interval);
+  }, [open, onlineMode, appId]);
 
   if (!open) return null;
 
@@ -67,7 +85,7 @@ export function LaunchConfigDialog({ open, appId, appName, gameDir, onClose }: P
 
     try {
       const result = await window.electronAPI.invoke(IPC.LAUNCH_GAME, {
-        exePath: selectedExe, appId, wineConfig: config,
+        exePath: selectedExe, appId, wineConfig: config, onlineMode,
       }) as any;
       if (!result.success) setError(result.message);
       else onClose();
@@ -190,6 +208,13 @@ export function LaunchConfigDialog({ open, appId, appName, gameDir, onClose }: P
           </div>
         </div>
 
+        {onlineMode && steamRunning === false && (
+          <div className="flex items-start gap-2 text-[13px] text-yellow-400 mb-3 px-3 py-2.5 bg-yellow-400/10 rounded-lg border border-yellow-400/20">
+            <IconAlertTriangle size={15} stroke={1.5} className="mt-0.5 shrink-0" />
+            <span>Steam is not running. Start Steam and log in before launching in online mode.</span>
+          </div>
+        )}
+
         {error && (
           <div className="flex items-start gap-2 text-[13px] text-red-400 mb-3">
             <IconAlertTriangle size={15} stroke={1.5} className="mt-0.5 shrink-0" />
@@ -202,7 +227,7 @@ export function LaunchConfigDialog({ open, appId, appName, gameDir, onClose }: P
             className="flex-1 px-4 py-2 rounded-lg bg-white/5 text-txt-secondary text-[13px] hover:bg-white/10 transition-colors">
             Cancel
           </button>
-          <button onClick={handleLaunch} disabled={!selectedExe || launching}
+          <button onClick={handleLaunch} disabled={!selectedExe || launching || (onlineMode && steamRunning === false)}
             className="flex-1 flex items-center justify-center gap-1.5 px-4 py-2 rounded-lg bg-green-500/80 text-white text-[13px] font-medium
                        hover:bg-green-500 disabled:opacity-30 disabled:cursor-not-allowed transition-colors">
             {launching ? <IconLoader size={15} className="animate-spin" /> : <IconPlayerPlay size={15} stroke={1.5} />}

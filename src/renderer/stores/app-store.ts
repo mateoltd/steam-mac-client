@@ -19,6 +19,7 @@ interface AppState {
   isAuthenticated: boolean;
   setCredentials: (username: string, password: string) => void;
   clearCredentials: () => void;
+  loadSavedCredentials: () => Promise<void>;
 }
 
 export const useAppStore = create<AppState>((set) => ({
@@ -40,14 +41,18 @@ export const useAppStore = create<AppState>((set) => ({
   steamUsername: '',
   steamPassword: '',
   isAuthenticated: false,
-  setCredentials: (username, password) => set({
-    steamUsername: username,
-    steamPassword: password,
-    isAuthenticated: true,
-  }),
-  clearCredentials: () => set({
-    steamUsername: '',
-    steamPassword: '',
-    isAuthenticated: false,
-  }),
+  setCredentials: (username, password) => {
+    set({ steamUsername: username, steamPassword: password, isAuthenticated: true });
+    window.electronAPI.invoke(IPC.SAVE_CREDENTIALS, { username, password });
+  },
+  clearCredentials: () => {
+    set({ steamUsername: '', steamPassword: '', isAuthenticated: false });
+    window.electronAPI.invoke(IPC.CLEAR_CREDENTIALS);
+  },
+  loadSavedCredentials: async () => {
+    const creds = await window.electronAPI.invoke(IPC.LOAD_CREDENTIALS) as { username: string; password: string } | null;
+    if (creds) {
+      set({ steamUsername: creds.username, steamPassword: creds.password, isAuthenticated: true });
+    }
+  },
 }));

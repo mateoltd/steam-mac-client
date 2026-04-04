@@ -9,15 +9,23 @@ import type { Depot } from '../../shared/types';
 export function GameDetailPanel() {
   const { selectedGame, depots, isLoadingDepots, depotError, selectedDepotId, selectDepot } = useSearchStore();
   const { isAuthenticated, steamUsername, steamPassword, toolStatus, setSidebarItem } = useAppStore();
-  const startDownload = useDownloadStore((s) => s.startDownload);
+  const { tasks, startDownload } = useDownloadStore();
   const [loginOpen, setLoginOpen] = useState(false);
 
   if (!selectedGame) return null;
   const app = selectedGame;
   const selectedDepot = depots.find(d => d.id === selectedDepotId);
 
+  const existingTask = selectedDepotId
+    ? tasks.find(t => t.appId === app.id && t.depotId === selectedDepotId)
+    : null;
+
   const handleDownload = async () => {
     if (!selectedDepotId || !isAuthenticated) return;
+    if (existingTask) {
+      setSidebarItem('downloads');
+      return;
+    }
     await startDownload(app.id, app.name, selectedDepotId, steamUsername, steamPassword);
     setSidebarItem('downloads');
   };
@@ -93,7 +101,7 @@ export function GameDetailPanel() {
                        hover:bg-accent-hover disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
           >
             <IconDownload size={15} stroke={1.5} />
-            Download
+            {existingTask ? 'View Download' : 'Download'}
           </button>
         )}
       </div>

@@ -11,6 +11,8 @@ export const IPC = {
   INSTALL_STEAM_IN_PREFIX: 'launch:install-steam',
   LAUNCH_STEAM_IN_PREFIX: 'launch:start-steam',
   REPAIR_STEAM_IN_PREFIX: 'launch:repair-steam',
+  SHUTDOWN_STEAM_IN_PREFIX: 'launch:shutdown-steam',
+  IS_STEAM_RUNNING: 'launch:is-steam-running',
   GET_ARCHITECTURE: 'platform:arch',
 
   // Actions (renderer triggers)
@@ -22,6 +24,10 @@ export const IPC = {
   INSTALL_SINGLE_TOOL: 'tools:install-single',
   REINSTALL_ALL: 'tools:reinstall-all',
   REVEAL_IN_FINDER: 'shell:reveal',
+  SAVE_CREDENTIALS: 'credentials:save',
+  LOAD_CREDENTIALS: 'credentials:load',
+  CLEAR_CREDENTIALS: 'credentials:clear',
+  SCAN_DOWNLOADS: 'downloads:scan',
 
   // Streaming channels (main pushes to renderer)
   DOWNLOAD_PROGRESS: 'download:progress',
@@ -30,4 +36,5 @@ export const IPC = {
   DOWNLOAD_AUTH_PROMPT: 'download:auth-prompt',
   INSTALL_PROGRESS: 'install:progress',
   INSTALL_LOG: 'install:log',
+  STEAM_LOG: 'launch:steam-log',
 } as const;

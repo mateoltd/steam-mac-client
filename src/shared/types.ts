@@ -44,6 +44,9 @@ export interface ToolStatus {
   depotDownloaderPath: string | null;
   winePath: string | null;
   gptkPath: string | null;
+  wineStagingPath: string | null;
+  wineCrossoverPath: string | null;
+  dxvkPath: string | null;
   hasDownloadTool: boolean;
   hasWineTool: boolean;
 }

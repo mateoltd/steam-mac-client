@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import type { ToolStatus } from '../../shared/types';
-import { getDepotDownloaderDir } from '../lib/paths';
+import { getDepotDownloaderDir, getWineStagingBinary, getWineCrossoverBinary, getDxvkDir } from '../lib/paths';
 
 const SEARCH_PATHS = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin'];
 
@@ -11,14 +11,20 @@ export async function locateTools(): Promise<ToolStatus> {
   const depotDownloaderPath = findDepotDownloader();
   const winePath = findWine();
   const gptkPath = findGPTK();
+  const wineStagingPath = findWineStaging();
+  const wineCrossoverPath = findWineCrossover();
+  const dxvkPath = findDxvk();
 
   return {
     steamcmdPath,
     depotDownloaderPath,
     winePath,
     gptkPath,
+    wineStagingPath,
+    wineCrossoverPath,
+    dxvkPath,
     hasDownloadTool: !!(depotDownloaderPath || steamcmdPath),
-    hasWineTool: !!(winePath || gptkPath),
+    hasWineTool: !!(winePath || gptkPath || wineStagingPath || wineCrossoverPath),
   };
 }
 
@@ -70,6 +76,46 @@ function findGPTK(): string | null {
   }
 
   return findTool('gameportingtoolkit');
+}
+
+function findWineStaging(): string | null {
+  // Our own managed install (downloaded from Gcenx GitHub releases)
+  const managedPath = getWineStagingBinary();
+  if (isExecutable(managedPath)) return managedPath;
+
+  // Homebrew cask or manual install in /Applications
+  const stagingPaths = [
+    '/Applications/Wine Staging.app/Contents/Resources/wine/bin/wine',
+    '/Applications/Wine Staging.app/Contents/Resources/wine/bin/wine64',
+  ];
+  for (const p of stagingPaths) {
+    if (isExecutable(p)) return p;
+  }
+  return null;
+}
+
+function findWineCrossover(): string | null {
+  // Our own managed install
+  const managedPath = getWineCrossoverBinary();
+  if (isExecutable(managedPath)) return managedPath;
+
+  // Homebrew cask or manual install in /Applications
+  const crossoverPaths = [
+    '/Applications/Wine Crossover.app/Contents/Resources/wine/bin/wine64',
+    '/Applications/Wine Crossover.app/Contents/Resources/wine/bin/wine',
+  ];
+  for (const p of crossoverPaths) {
+    if (isExecutable(p)) return p;
+  }
+  return null;
+}
+
+function findDxvk(): string | null {
+  const dir = getDxvkDir();
+  const x64Dir = path.join(dir, 'x64');
+  // Check that at least d3d11.dll exists in the x64 directory
+  if (fs.existsSync(path.join(x64Dir, 'd3d11.dll'))) return dir;
+  return null;
 }
 
 function findTool(name: string): string | null {

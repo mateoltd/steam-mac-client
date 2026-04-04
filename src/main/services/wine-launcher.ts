@@ -5,9 +5,11 @@ import { spawn } from 'node:child_process';
 import { runProcess, spawnInteractive } from './process-runner';
 import { locateTools } from './tool-locator';
 import { stripQuarantine } from './quarantine';
-import { getPrefixDir, getAppDataDir } from '../lib/paths';
+import { getPrefixDir, getGamePrefixDir, getAppDataDir, getDxvkDir } from '../lib/paths';
 import { isAppleSilicon } from '../lib/platform';
 import { getLogger } from '../lib/logger';
+import { applyGoldberg } from './steam-emu';
+import { loadCredentials } from './credential-store';
 import type { WineConfig, WineBackend } from '../../shared/types';
 
 const STEAM_SETUP_URL = 'https://cdn.akamai.steamstatic.com/client/installer/SteamSetup.exe';
@@ -40,6 +42,8 @@ export function isSteamInstalledInPrefix(prefixDir: string): boolean {
 
 /**
  * Install the Windows Steam client into a Wine prefix.
+ * Uses Wine Staging (11.x) instead of GPTK because Steam's steamwebhelper
+ * requires Wine 11.0+ for WSALookupServiceBegin to work.
  */
 export async function installSteamInPrefix(
   appId: number,
@@ -50,10 +54,13 @@ export async function installSteamInPrefix(
   const logLine = onLog || (() => {});
 
   const tools = await locateTools();
-  const wineBinary = resolveWineBinary(backend, tools.gptkPath, tools.winePath);
+  // Use Wine Staging for prefix creation — Steam login requires steamwebhelper
+  // which only works on Wine 11.0+ (WSALookupServiceBegin).
+  const wineBinary = tools.wineStagingPath || resolveSteamWineBinary(tools);
   if (!wineBinary) {
-    return { success: false, message: 'No Wine/GPTK found.' };
+    return { success: false, message: 'Wine Staging not found. Install from Settings (required for Steam).' };
   }
+  logLine(`Using Wine: ${wineBinary}`);
 
   const prefixDir = getPrefixDir(appId);
   fs.mkdirSync(prefixDir, { recursive: true });
@@ -68,6 +75,8 @@ export async function installSteamInPrefix(
   if (!fs.existsSync(path.join(prefixDir, 'system.reg'))) {
     logLine('Initializing Wine prefix...');
     await runProcess(wineBinary, ['wineboot', '--init'], { env });
+    await enableClipboardSharing(wineBinary, env);
+    await disableCrashDialog(wineBinary, env);
   }
 
   // Download SteamSetup.exe (always re-download to avoid corrupt cached copies)
@@ -107,10 +116,6 @@ export async function installSteamInPrefix(
   if (!steamExe) {
     return { success: false, message: 'Steam installation could not be verified.' };
   }
-
-  // Write steam_dev.cfg to persistently disable CEF sandbox.
-  // This survives Steam self-restarts (env vars don't).
-  writeSteamDevConfig(path.dirname(steamExe));
 
   logLine('Steam installed. It will self-update on first launch.');
   return { success: true, message: 'Steam installed successfully.' };
@@ -187,13 +192,107 @@ export async function launchSteamInPrefix(
     return { success: false, message: 'Steam not installed in prefix. Install it first.' };
   }
 
-  // Ensure steam_dev.cfg is always in place (self-healing)
-  writeSteamDevConfig(path.dirname(steamExe));
+  const tools = await locateTools();
+  // Use Wine Staging for Steam login — it's the only Wine version where
+  // steamwebhelper (CEF) works (requires WSALookupServiceBegin, Wine 11.0+).
+  // After login, the game launch flow switches to wine-crossover.
+  const wineBinary = tools.wineStagingPath || resolveSteamWineBinary(tools);
+  if (!wineBinary) {
+    return { success: false, message: 'Wine Staging not found. Install from Settings (required for Steam login).' };
+  }
+
+  logLine(`Using Wine: ${wineBinary}`);
+
+  const env = buildEnvironment(wineBinary, prefixDir, backend, {
+    dllOverrides: {},
+    environmentVariables: {},
+    windowsVersion: 'win10',
+  });
+
+  log.info({ steamExe, prefixDir, wineBinary }, 'Launching Steam in Wine prefix');
+
+  const mergedEnv = {
+    ...process.env,
+    ...env,
+    WINEDEBUG: '-all',
+  };
+
+  // No special args for login — let Steam show its full UI so the user can
+  // authenticate (including Steam Guard 2FA). The game launch flow will later
+  // restart Steam headlessly under wine-crossover.
+  const steamArgs: string[] = [];
+
+  // Start tailing Steam's bootstrap log for update progress
+  const steamDir = path.dirname(steamExe);
+  const bootstrapLogPath = path.join(steamDir, 'logs', 'bootstrap_log.txt');
+  const logWatcher = tailSteamLog(bootstrapLogPath, logLine);
+
+  // Launch Steam with auto-restart support.
+  // Exit code 42 = Steam self-update restart signal (NOT a crash).
+  const MAX_RESTARTS = 5;
+  let restarts = 0;
+  let currentSteamExe = steamExe;
+
+  while (restarts <= MAX_RESTARTS) {
+    const result = await spawnSteamMonitored(wineBinary, currentSteamExe, steamArgs, mergedEnv, log, logLine);
+
+    if (result.alive) {
+      // Steam is running — success
+      return { success: true, message: 'Steam is running. You can now launch the game.' };
+    }
+
+    // Exit code 42 = Steam updated itself and wants a restart
+    if (result.exitCode === 42) {
+      restarts++;
+      logLine(`Steam is updating (restart ${restarts}/${MAX_RESTARTS})...`);
+      log.info({ restarts, exitCode: 42 }, 'Steam self-update restart');
+      currentSteamExe = getSteamExePath(prefixDir) || currentSteamExe;
+      continue;
+    }
+
+    // Actual crash — try repair once
+    logWatcher.stop();
+    logLine(`Steam exited unexpectedly (code ${result.exitCode}). Repairing...`);
+    log.warn({ exitCode: result.exitCode }, 'Steam process died — auto-repairing');
+    const repairResult = await repairSteamInPrefix(appId, backend, onLog);
+    if (!repairResult.success) return repairResult;
+
+    currentSteamExe = getSteamExePath(prefixDir)!;
+    const retryResult = await spawnSteamMonitored(wineBinary, currentSteamExe, steamArgs, mergedEnv, log, logLine);
+    if (retryResult.alive) {
+      return { success: true, message: 'Steam is running. You can now launch the game.' };
+    }
+    if (retryResult.exitCode === 42) {
+      restarts++;
+      logLine('Steam is updating after repair...');
+      continue;
+    }
+    return { success: false, message: `Steam keeps crashing (exit code ${retryResult.exitCode}). The Wine prefix may be incompatible.` };
+  }
+
+  return { success: false, message: 'Steam is stuck in an update loop. Try restarting the app.' };
+}
+
+/**
+ * Gracefully shut down Steam running in a Wine prefix.
+ * Sends `steam.exe -shutdown` which lets Steam run its normal exit sequence
+ * (saving state, closing connections) instead of killing the process.
+ */
+export async function shutdownSteamInPrefix(
+  appId: number,
+  backend: WineBackend,
+): Promise<LaunchResult> {
+  const log = getLogger();
+  const prefixDir = getPrefixDir(appId);
+  const steamExe = getSteamExePath(prefixDir);
+  if (!steamExe) {
+    return { success: false, message: 'Steam not found in prefix.' };
+  }
 
   const tools = await locateTools();
-  const wineBinary = resolveWineBinary(backend, tools.gptkPath, tools.winePath);
+  const wineBinary = resolveSteamWineBinary(tools);
   if (!wineBinary) {
-    return { success: false, message: 'No Wine/GPTK found.' };
+    return { success: false, message: 'Wine not found.' };
   }
 
   const env = buildEnvironment(wineBinary, prefixDir, backend, {
@@ -202,137 +301,227 @@ export async function launchSteamInPrefix(
     windowsVersion: 'win10',
   });
 
-  log.info({ steamExe, prefixDir }, 'Launching Steam in Wine prefix');
+  log.info({ prefixDir }, 'Sending Steam graceful shutdown');
 
-  const mergedEnv = {
-    ...process.env,
-    ...env,
-    STEAM_DISABLE_BROWSER_SANDBOX: '1',
-    WINEDEBUG: '-all',
-  };
+  const mergedEnv = { ...process.env, ...env, WINEDEBUG: '-all' };
 
-  // Spawn Steam with CEF workaround flags.
-  // -cef-disable-sandbox: Chromium sandbox fails under Wine
-  // -cef-disable-gpu: GPU accel in CEF crashes under Wine/GPTK
-  // -noreactlogin: use older, more Wine-compatible login UI
-  // These are also written to steam_dev.cfg for when Steam self-restarts.
-  const result = await spawnSteamMonitored(wineBinary, steamExe, mergedEnv, log);
-
-  if (!result.alive) {
-    // Steam died within seconds — try auto-repair once
-    logLine('Steam exited immediately. Repairing and retrying...');
-    log.warn('Steam process died within monitor window — auto-repairing');
-    const repairResult = await repairSteamInPrefix(appId, backend, onLog);
-    if (!repairResult.success) return repairResult;
-
-    steamExe = getSteamExePath(prefixDir)!;
-    writeSteamDevConfig(path.dirname(steamExe));
-
-    const retry = await spawnSteamMonitored(wineBinary, steamExe, mergedEnv, log);
-    if (!retry.alive) {
-      return { success: false, message: `Steam keeps crashing (exit code ${retry.exitCode}). The Wine prefix may be incompatible.` };
-    }
+  try {
+    // steam.exe -shutdown tells the running Steam instance to exit gracefully
+    await runProcess(wineBinary, [steamExe, '-shutdown'], {
+      env: mergedEnv,
+    });
+    return { success: true, message: 'Steam is shutting down.' };
+  } catch (err) {
+    log.error({ err }, 'Steam shutdown failed');
+    return { success: false, message: `Shutdown failed: ${err}` };
   }
+}
 
-  return { success: true, message: 'Steam is starting. Log in, then launch the game.' };
+// --- Steam-specific Wine resolution ---
+
+/**
+ * Resolve the Wine binary for Steam client operations and online game launches.
+ *
+ * Priority:
+ *   1. Wine Crossover (CodeWeavers patches: macOS VA fixes + Steam support)
+ *   2. Wine Staging 11.x (Steam works but games may crash from mmap errors)
+ *   3. Fallback to any available Wine
+ */
+function resolveSteamWineBinary(tools: import('../../shared/types').ToolStatus): string | null {
+  if (tools.wineCrossoverPath) return tools.wineCrossoverPath;
+  if (tools.wineStagingPath) return tools.wineStagingPath;
+  return tools.winePath || tools.gptkPath;
 }
 
 // --- Steam health & config helpers ---
 
-/**
- * Verify that a Steam installation in a prefix has the critical files needed to run.
- * Returns false if Steam looks corrupt or incomplete.
- */
 function verifySteamHealth(prefixDir: string): boolean {
   const steamExe = getSteamExePath(prefixDir);
   if (!steamExe) return false;
 
   const steamDir = path.dirname(steamExe);
 
-  // Check that steam.exe isn't a 0-byte stub
   try {
     const stat = fs.statSync(steamExe);
-    if (stat.size < 100_000) return false; // steam.exe should be > 100KB
+    if (stat.size < 100_000) return false;
   } catch {
     return false;
   }
 
-  // Check for critical Steam runtime files
-  const criticalFiles = [
-    'tier0_s64.dll',
-    'vstdlib_s64.dll',
-  ];
+  const criticalFiles = ['tier0_s64.dll', 'vstdlib_s64.dll'];
   for (const file of criticalFiles) {
-    if (!fs.existsSync(path.join(steamDir, file))) {
-      return false;
-    }
+    if (!fs.existsSync(path.join(steamDir, file))) return false;
   }
 
   return true;
 }
 
 /**
- * Write steam_dev.cfg next to steam.exe.
- * This persists CEF sandbox/GPU settings across Steam self-restarts
- * (environment variables are lost when Steam re-launches itself during updates).
- */
-function writeSteamDevConfig(steamDir: string): void {
-  const cfgPath = path.join(steamDir, 'steam_dev.cfg');
-  const content = [
-    '@nRendererCefSandbox 0',
-    '@nRendererCefDisableGpu 1',
-    '@fSteamAutoUpdateTimerFrequencySeconds 0',
-  ].join('\n') + '\n';
-  fs.writeFileSync(cfgPath, content, 'utf-8');
-}
-
-/**
  * Spawn Steam and monitor it for a short window to detect immediate crashes.
- * Returns { alive: true } if Steam is still running after the monitor period,
- * or { alive: false, exitCode } if it died.
+ * After the initial window, keeps a background watcher that auto-restarts
+ * Steam on exit code 42 (self-update restart signal).
  */
 function spawnSteamMonitored(
   wineBinary: string,
   steamExe: string,
+  steamArgs: string[],
   env: Record<string, string>,
   log: ReturnType<typeof getLogger>,
+  onLog?: (line: string) => void,
 ): Promise<{ alive: boolean; exitCode?: number }> {
   return new Promise((resolve) => {
-    const proc = spawn(wineBinary, [
-      steamExe,
-      '-cef-disable-sandbox',
-      '-cef-disable-gpu',
-      '-noreactlogin',
-    ], {
-      env,
-      stdio: 'ignore',
-      detached: true,
-    });
+    let resolved = false;
 
-    let exited = false;
-    let exitCode: number | undefined;
+    const launchSteam = () => {
+      const proc = spawn(wineBinary, [steamExe, ...steamArgs], {
+        env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        detached: true,
+      });
 
-    proc.on('exit', (code) => {
-      exited = true;
-      exitCode = code ?? undefined;
-      log.warn({ exitCode: code }, 'Steam process exited during monitor window');
-    });
+      let exited = false;
+      let exitCode: number | undefined;
 
-    proc.on('error', (err) => {
-      exited = true;
-      log.error({ err }, 'Steam process error');
-    });
-
-    // Monitor for 8 seconds, then detach if still alive
-    setTimeout(() => {
-      if (exited) {
-        resolve({ alive: false, exitCode });
-      } else {
-        proc.unref();
-        resolve({ alive: true });
+      // Stream Wine output to the log callback
+      if (proc.stderr) {
+        const { createInterface } = require('node:readline');
+        const rl = createInterface({ input: proc.stderr });
+        rl.on('line', (line: string) => {
+          log.debug({ stream: 'steam-stderr' }, line);
+          if (onLog && !line.includes('fixme:') && !line.includes('trace:')) {
+            onLog(line);
+          }
+        });
       }
-    }, 8000);
+      if (proc.stdout) {
+        const { createInterface } = require('node:readline');
+        const rl = createInterface({ input: proc.stdout });
+        rl.on('line', (line: string) => {
+          log.debug({ stream: 'steam-stdout' }, line);
+          onLog?.(line);
+        });
+      }
+
+      proc.on('exit', (code) => {
+        exited = true;
+        exitCode = code ?? undefined;
+        log.info({ exitCode: code }, 'Steam process exited');
+
+        if (!resolved) {
+          // Still in the initial monitor window — report to caller
+          return;
+        }
+
+        // Background: handle exit code 42 (self-update restart)
+        if (code === 42) {
+          log.info('Steam requested restart after update (exit code 42)');
+          onLog?.('Steam is restarting after update...');
+          // Small delay to let file writes settle
+          setTimeout(() => launchSteam(), 2000);
+        } else if (code !== 0) {
+          log.warn({ exitCode: code }, 'Steam exited unexpectedly in background');
+          onLog?.(`Steam exited (code ${code}).`);
+        }
+      });
+
+      proc.on('error', (err) => {
+        exited = true;
+        log.error({ err }, 'Steam process error');
+      });
+
+      // Monitor for 10 seconds, then report to caller
+      setTimeout(() => {
+        if (resolved) return; // already resolved by a previous launch
+        resolved = true;
+
+        if (exited) {
+          resolve({ alive: false, exitCode });
+        } else {
+          // Steam survived the monitor window — keep pipes open for
+          // background log streaming and exit code 42 handling
+          proc.unref();
+          resolve({ alive: true });
+        }
+      }, 10_000);
+    };
+
+    launchSteam();
   });
+}
+
+/**
+ * Tail Steam's bootstrap_log.txt to stream update progress to the renderer.
+ * Returns a handle to stop tailing.
+ */
+function tailSteamLog(
+  logPath: string,
+  onLog: (line: string) => void,
+): { stop: () => void } {
+  let watching = true;
+  let lastSize = 0;
+  let interval: ReturnType<typeof setInterval> | null = null;
+
+  // Auto-stop after 5 minutes
+  const timeout = setTimeout(() => { watching = false; }, 5 * 60 * 1000);
+
+  const read = () => {
+    if (!watching) {
+      if (interval) clearInterval(interval);
+      return;
+    }
+    try {
+      if (!fs.existsSync(logPath)) return;
+      const stat = fs.statSync(logPath);
+      if (stat.size <= lastSize) return;
+
+      const fd = fs.openSync(logPath, 'r');
+      const buf = Buffer.alloc(stat.size - lastSize);
+      fs.readSync(fd, buf, 0, buf.length, lastSize);
+      fs.closeSync(fd);
+      lastSize = stat.size;
+
+      const lines = buf.toString('utf-8').split('\n').filter(l => l.trim());
+      for (const line of lines) {
+        onLog(`[Steam] ${line}`);
+      }
+    } catch {
+      // File might be locked by Steam — ignore
+    }
+  };
+
+  interval = setInterval(read, 2000);
+
+  return {
+    stop: () => {
+      watching = false;
+      clearTimeout(timeout);
+      if (interval) clearInterval(interval);
+    },
+  };
+}
+
+/**
+ * Check if Steam is currently running in a Wine prefix.
+ * Works by checking if there's an active wineserver for the prefix.
+ */
+export async function isSteamRunningInPrefix(appId: number, backend: WineBackend): Promise<boolean> {
+  const prefixDir = getPrefixDir(appId);
+  const tools = await locateTools();
+  const wineBinary = resolveSteamWineBinary(tools);
+  if (!wineBinary) return false;
+
+  const wineDir = path.dirname(wineBinary);
+  const wineserver = path.join(wineDir, 'wineserver');
+
+  try {
+    // wineserver -k 0 pings the server without killing it; exits 0 if running
+    const result = await runProcess(wineserver, ['-k', '0'], {
+      env: { ...process.env, WINEPREFIX: prefixDir, WINEDEBUG: '-all' },
+    });
+    return result.exitCode === 0;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -344,6 +533,7 @@ export async function launchGame(
   appId: number,
   wineConfig: WineConfig,
   backend: WineBackend,
+  onlineMode: boolean,
 ): Promise<LaunchResult> {
   const log = getLogger();
 
@@ -352,15 +542,57 @@ export async function launchGame(
   }
 
   const tools = await locateTools();
-  const wineBinary = resolveWineBinary(backend, tools.gptkPath, tools.winePath);
-  if (!wineBinary) {
-    return { success: false, message: 'No Wine or GPTK installation found. Install from Settings.' };
+
+  // Wine binary + prefix selection depends on mode and architecture:
+  //
+  // ONLINE MODE (Intel x64):
+  //   Wine Staging 11.5 runs natively — no Rosetta 2, no mmap crashes.
+  //   Same Wine version for Steam and game, single prefix.
+  //
+  // ONLINE MODE (Apple Silicon):
+  //   Not yet supported — no Wine version can run both Steam (needs 9.0+
+  //   for steamwebhelper) and games (mmap crash under Rosetta 2) in one prefix.
+  //
+  // OFFLINE MODE: GPTK with separate prefix + Goldberg emulator.
+  let wineBinary: string | null;
+  let prefixDir: string;
+
+  if (onlineMode) {
+    if (isAppleSilicon()) {
+      return {
+        success: false,
+        message: 'Online mode is not yet supported on Apple Silicon Macs. An Intel Mac is required for online play. You can use offline mode with this game instead.',
+      };
+    }
+
+    // Intel: Wine Staging handles everything — same prefix as Steam
+    wineBinary = tools.wineStagingPath || resolveSteamWineBinary(tools);
+    prefixDir = getPrefixDir(appId);
+  } else {
+    // Prefer GPTK (D3DMetal, stable), then crossover, then staging
+    wineBinary = resolveWineBinary(backend, tools.gptkPath, tools.winePath)
+      || resolveSteamWineBinary(tools);
+    // Use separate game prefix if Wine version differs from Steam's
+    const steamWine = resolveSteamWineBinary(tools);
+    prefixDir = (steamWine && steamWine !== wineBinary)
+      ? getGamePrefixDir(appId)
+      : getPrefixDir(appId);
   }
 
-  const prefixDir = getPrefixDir(appId);
+  if (!wineBinary) {
+    return { success: false, message: 'No Wine installation found. Install from Settings.' };
+  }
   fs.mkdirSync(prefixDir, { recursive: true });
 
   const env = buildEnvironment(wineBinary, prefixDir, backend, wineConfig);
+
+  // On Apple Silicon (Rosetta 2), disable esync/fsync to reduce virtual address
+  // space pressure that causes mmap "Cannot allocate memory" errors.
+  // On Intel, these can stay enabled — no Rosetta 2 VA conflicts.
+  if (isAppleSilicon()) {
+    env.WINEESYNC = '0';
+    env.WINEFSYNC = '0';
+  }
 
   log.info({ exePath, wineBinary, backend, prefixDir }, 'Launching game');
 
@@ -368,8 +600,15 @@ export async function launchGame(
   const gameDir = path.dirname(exePath);
   await stripQuarantine(gameDir);
 
-  // Restore original steam_api DLLs if Goldberg was previously applied
-  restoreOriginalSteamDlls(gameDir);
+  if (onlineMode) {
+    // Online: restore original DLLs so the game uses real Steam
+    restoreOriginalSteamDlls(gameDir);
+  } else {
+    // Offline: apply Goldberg emulator — fakes Steamworks API, no Steam needed
+    restoreOriginalSteamDlls(gameDir); // undo any previous Goldberg first
+    const emu = applyGoldberg(gameDir, appId);
+    log.info({ applied: emu.applied, message: emu.message }, 'Goldberg emulator');
+  }
 
   // Write steam_appid.txt so the game knows its app ID
   const appIdFile = path.join(gameDir, 'steam_appid.txt');
@@ -379,6 +618,8 @@ export async function launchGame(
   if (!fs.existsSync(path.join(prefixDir, 'system.reg'))) {
     log.info({ prefixDir }, 'Initializing Wine prefix');
     await runProcess(wineBinary, ['wineboot', '--init'], { env });
+    await enableClipboardSharing(wineBinary, env);
+    await disableCrashDialog(wineBinary, env);
   }
 
   // Set Windows version via registry if needed
@@ -386,22 +627,57 @@ export async function launchGame(
     await setWindowsVersion(wineBinary, prefixDir, wineConfig.windowsVersion, env);
   }
 
+  // Install DXVK DLLs in the prefix (D3D10/D3D11 → Vulkan → MoltenVK → Metal).
+  // Skip DXVK when using GPTK — it has Apple's D3DMetal which translates D3D→Metal
+  // directly and is faster/more compatible than the DXVK→Vulkan→MoltenVK→Metal chain.
+  if (!isGPTKBinary(wineBinary)) {
+    const dxvkApplied = installDxvkInPrefix(prefixDir);
+    if (dxvkApplied) {
+      const dxvkOverrides = DXVK_DLLS.map(d => `${d.replace('.dll', '')}=n`).join(';');
+      env.WINEDLLOVERRIDES = env.WINEDLLOVERRIDES
+        ? `${env.WINEDLLOVERRIDES};${dxvkOverrides}`
+        : dxvkOverrides;
+      log.info('DXVK enabled — D3D10/D3D11 will use Vulkan via MoltenVK');
+    }
+  } else {
+    log.info('Using GPTK D3DMetal — skipping DXVK');
+  }
+
   // Launch the game
   try {
-    log.info({ env: { WINEPREFIX: env.WINEPREFIX, DYLD_FALLBACK_LIBRARY_PATH: env.DYLD_FALLBACK_LIBRARY_PATH, WINEESYNC: env.WINEESYNC } }, 'Wine environment');
+    log.info({ env: { WINEPREFIX: env.WINEPREFIX, DYLD_FALLBACK_LIBRARY_PATH: env.DYLD_FALLBACK_LIBRARY_PATH, WINEESYNC: env.WINEESYNC, WINEFSYNC: env.WINEFSYNC, WINEDLLOVERRIDES: env.WINEDLLOVERRIDES } }, 'Wine environment');
+    const launchTime = Date.now();
     const result = await runProcess(wineBinary, [exePath], {
       env,
       onStdoutLine: (line) => log.debug({ stream: 'stdout' }, line),
       onStderrLine: (line) => log.debug({ stream: 'stderr' }, line),
     });
-    log.info({ exitCode: result.exitCode, stdoutLen: result.stdout.length, stderrLen: result.stderr.length }, 'Game process exited');
+    const elapsed = Date.now() - launchTime;
+    log.info({ exitCode: result.exitCode, stdoutLen: result.stdout.length, stderrLen: result.stderr.length, elapsedMs: elapsed }, 'Game process exited');
+    if (result.stdout) {
+      log.info({ stdout: result.stdout.slice(0, 2000) }, 'Game stdout output');
+    }
     if (result.stderr) {
       log.warn({ stderr: result.stderr.slice(0, 2000) }, 'Game stderr output');
     }
+
+    // Build a combined output for error display (stdout often has the real error)
+    const combinedOutput = [
+      result.stdout ? result.stdout.slice(0, 500) : '',
+      result.stderr ? result.stderr.slice(0, 500) : '',
+    ].filter(Boolean).join('\n');
+
     if (result.exitCode !== 0) {
-      return { success: false, message: `Game exited with code ${result.exitCode}\n${result.stderr.slice(0, 500)}` };
+      return { success: false, message: `Game exited with code ${result.exitCode}\n${combinedOutput}` };
     }
-    return { success: true, message: 'Game launched successfully.' };
+
+    // A game that exits with code 0 in under 5 seconds almost certainly didn't
+    // actually run — it hit an init error (Steam not found, DRM check, etc.)
+    if (elapsed < 5000) {
+      return { success: false, message: `Game exited immediately (${Math.round(elapsed / 1000)}s).\n${combinedOutput || 'No output — check the log file for details.'}` };
+    }
+
+    return { success: true, message: 'Game exited.' };
   } catch (err) {
     log.error({ err }, 'Failed to launch game');
     return { success: false, message: `Launch failed: ${err}` };
@@ -480,6 +756,16 @@ function buildEnvironment(
     env.WINEESYNC = '1';
   }
 
+  // Ensure Wine Staging's lib directory is in the library path so MoltenVK
+  // (bundled as libMoltenVK.dylib) is discoverable for DXVK's Vulkan calls
+  const wineLibDir = path.join(wineDir, 'lib');
+  if (fs.existsSync(path.join(wineLibDir, 'libMoltenVK.dylib'))) {
+    const existing = env.DYLD_FALLBACK_LIBRARY_PATH || '';
+    env.DYLD_FALLBACK_LIBRARY_PATH = existing
+      ? `${wineLibDir}:${existing}`
+      : `${wineLibDir}:/usr/lib`;
+  }
+
   Object.assign(env, config.environmentVariables);
   return env;
 }
@@ -520,6 +806,97 @@ async function setWindowsVersion(
   await runProcess(wineBinary, [
     'reg', 'add', 'HKEY_CURRENT_USER\\Software\\Wine', '/v', 'Version', '/d', winVer, '/f',
   ], { env });
+}
+
+async function enableClipboardSharing(
+  wineBinary: string,
+  env: Record<string, string>,
+): Promise<void> {
+  await runProcess(wineBinary, [
+    'reg', 'add', 'HKEY_CURRENT_USER\\Software\\Wine\\X11 Driver', '/v', 'Clipboard', '/d', 'true', '/f',
+  ], { env });
+}
+
+async function disableCrashDialog(
+  wineBinary: string,
+  env: Record<string, string>,
+): Promise<void> {
+  // Disable Wine's crash/debug dialog (WineDbg) — suppresses the scary
+  // "Program Error" popup when Steam or its subprocesses exit uncleanly
+  await runProcess(wineBinary, [
+    'reg', 'add', 'HKEY_CURRENT_USER\\Software\\Wine\\WineDbg', '/v', 'ShowCrashDialog', '/t', 'REG_DWORD', '/d', '0', '/f',
+  ], { env });
+}
+
+/**
+ * Kill any running wineserver for a given prefix.
+ * Needed when switching between Wine versions on the same prefix.
+ */
+async function killWineserver(wineBinary: string, prefixDir?: string): Promise<void> {
+  const wineDir = path.dirname(wineBinary);
+  const wineserver = path.join(wineDir, 'wineserver');
+  try {
+    if (fs.existsSync(wineserver)) {
+      const killEnv: Record<string, string> = { ...process.env as Record<string, string>, WINEDEBUG: '-all' };
+      if (prefixDir) killEnv.WINEPREFIX = prefixDir;
+      await runProcess(wineserver, ['-k'], { env: killEnv });
+    }
+  } catch {
+    // Ignore — wineserver may not be running
+  }
+}
+
+// --- DXVK ---
+
+/**
+ * DXVK DLLs that get copied into the Wine prefix.
+ * On macOS (Gcenx/DXVK-macOS), only d3d10core and d3d11 are shipped —
+ * d3d9 and dxgi are deliberately excluded (not compatible with MoltenVK).
+ */
+const DXVK_DLLS = ['d3d10core.dll', 'd3d11.dll'];
+
+/**
+ * Install DXVK DLLs into a Wine prefix's system32/syswow64 directories.
+ * Returns true if DXVK was applied.
+ */
+function installDxvkInPrefix(prefixDir: string): boolean {
+  const log = getLogger();
+  const dxvkDir = getDxvkDir();
+
+  if (!fs.existsSync(path.join(dxvkDir, 'x64', 'd3d11.dll'))) {
+    log.debug('DXVK not installed — skipping prefix setup');
+    return false;
+  }
+
+  const sys32 = path.join(prefixDir, 'drive_c', 'windows', 'system32');
+  const sysWow64 = path.join(prefixDir, 'drive_c', 'windows', 'syswow64');
+
+  // Copy x64 DLLs to system32
+  const x64Dir = path.join(dxvkDir, 'x64');
+  if (fs.existsSync(x64Dir) && fs.existsSync(sys32)) {
+    for (const dll of DXVK_DLLS) {
+      const src = path.join(x64Dir, dll);
+      if (fs.existsSync(src)) {
+        fs.copyFileSync(src, path.join(sys32, dll));
+        log.debug({ dll, target: 'system32' }, 'Installed DXVK DLL');
+      }
+    }
+  }
+
+  // Copy x32 DLLs to syswow64
+  const x32Dir = path.join(dxvkDir, 'x32');
+  if (fs.existsSync(x32Dir) && fs.existsSync(sysWow64)) {
+    for (const dll of DXVK_DLLS) {
+      const src = path.join(x32Dir, dll);
+      if (fs.existsSync(src)) {
+        fs.copyFileSync(src, path.join(sysWow64, dll));
+        log.debug({ dll, target: 'syswow64' }, 'Installed DXVK DLL');
+      }
+    }
+  }
+
+  log.info({ prefixDir }, 'DXVK DLLs installed in prefix');
+  return true;
 }
 
 function walkDir(dir: string, callback: (filePath: string) => void, depth = 0): void {

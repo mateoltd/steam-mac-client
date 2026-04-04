@@ -35,7 +35,7 @@ export function LoginDialog({ open, onClose }: Props) {
       <div className="bg-bg-secondary rounded-xl shadow-2xl border border-border w-[360px] p-5">
         <h3 className="text-base font-semibold text-txt-primary mb-1">Steam Login</h3>
         <p className="text-xs text-txt-tertiary mb-5">
-          Credentials are stored in memory only and cleared on quit.
+          Credentials are encrypted and saved locally.
         </p>
 
         <form onSubmit={handleSubmit} className="space-y-3">

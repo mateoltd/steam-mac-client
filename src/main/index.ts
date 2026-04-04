@@ -1,5 +1,6 @@
-import { app, BrowserWindow, ipcMain, shell, dialog, safeStorage } from 'electron';
+import { app, BrowserWindow, ipcMain, shell, dialog } from 'electron';
 import path from 'node:path';
+import fs from 'node:fs';
 import { getLogger } from './lib/logger';
 import { getArchitecture } from './lib/platform';
 import { getDefaultDownloadDir } from './lib/paths';
@@ -8,7 +9,8 @@ import { getDepots } from './services/depot-info';
 import { locateTools } from './services/tool-locator';
 import { bootstrap, installSingleTool, reinstallAll } from './services/tool-installer';
 import { startDownload, cancelDownload, submitAuthCode } from './services/download-service';
-import { launchGame, findExecutables, isSteamInstalledInPrefix, installSteamInPrefix, launchSteamInPrefix, repairSteamInPrefix } from './services/wine-launcher';
+import { launchGame, findExecutables, isSteamInstalledInPrefix, installSteamInPrefix, launchSteamInPrefix, repairSteamInPrefix, shutdownSteamInPrefix, isSteamRunningInPrefix } from './services/wine-launcher';
+import { saveCredentials, loadCredentials, clearCredentials } from './services/credential-store';
 import { IPC } from '../shared/ipc-channels';
 import type { AppSettings, WineConfig, WineBackend } from '../shared/types';
 
@@ -176,13 +178,15 @@ function registerIpcHandlers() {
     exePath: string;
     appId: number;
     wineConfig: WineConfig;
+    onlineMode: boolean;
   }) => {
-    log.info({ exePath: params.exePath, appId: params.appId }, 'Launching game');
+    log.info({ exePath: params.exePath, appId: params.appId, onlineMode: params.onlineMode }, 'Launching game');
     return launchGame(
       params.exePath,
       params.appId,
       params.wineConfig,
       appSettings.wineBackend,
+      params.onlineMode,
     );
   });
 
@@ -203,14 +207,22 @@ function registerIpcHandlers() {
 
   ipcMain.handle(IPC.LAUNCH_STEAM_IN_PREFIX, async (_event, appId: number) => {
     return launchSteamInPrefix(appId, appSettings.wineBackend, (line) => {
-      sendToRenderer(IPC.INSTALL_LOG, { line });
+      sendToRenderer(IPC.STEAM_LOG, { line });
     });
   });
 
   ipcMain.handle(IPC.REPAIR_STEAM_IN_PREFIX, async (_event, appId: number) => {
     return repairSteamInPrefix(appId, appSettings.wineBackend, (line) => {
-      sendToRenderer(IPC.INSTALL_LOG, { line });
+      sendToRenderer(IPC.STEAM_LOG, { line });
     });
+  });
+
+  ipcMain.handle(IPC.SHUTDOWN_STEAM_IN_PREFIX, async (_event, appId: number) => {
+    return shutdownSteamInPrefix(appId, appSettings.wineBackend);
+  });
+
+  ipcMain.handle(IPC.IS_STEAM_RUNNING, async (_event, appId: number) => {
+    return isSteamRunningInPrefix(appId, appSettings.wineBackend);
   });
 
   // --- Settings ---
@@ -238,8 +250,40 @@ function registerIpcHandlers() {
     return result.canceled ? null : result.filePaths[0];
   });
 
+  ipcMain.handle(IPC.SCAN_DOWNLOADS, async () => {
+    const dir = appSettings.downloadDirectory || getDefaultDownloadDir();
+    if (!fs.existsSync(dir)) return [];
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    const results: { appId: number; appName: string; directory: string }[] = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      // Match pattern: AppName_12345
+      const match = entry.name.match(/^(.+)_(\d+)$/);
+      if (!match) continue;
+      results.push({
+        appName: match[1],
+        appId: parseInt(match[2], 10),
+        directory: path.join(dir, entry.name),
+      });
+    }
+    return results;
+  });
+
   ipcMain.handle(IPC.REVEAL_IN_FINDER, async (_event, filePath: string) => {
     shell.showItemInFolder(filePath);
+  });
+
+  // --- Credentials ---
+  ipcMain.handle(IPC.SAVE_CREDENTIALS, async (_event, params: { username: string; password: string }) => {
+    saveCredentials(params.username, params.password);
+  });
+
+  ipcMain.handle(IPC.LOAD_CREDENTIALS, async () => {
+    return loadCredentials();
+  });
+
+  ipcMain.handle(IPC.CLEAR_CREDENTIALS, async () => {
+    clearCredentials();
   });
 }
 
@@ -259,4 +303,36 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
   app.quit();
+});
+
+// Shut down wineservers for our managed prefixes on exit
+app.on('will-quit', () => {
+  const { execFileSync } = require('node:child_process');
+  const prefixesDir = path.join(app.getPath('appData'), 'SteamMacClient', 'Prefixes');
+  if (!fs.existsSync(prefixesDir)) return;
+
+  // Find all Wine binaries we might have used
+  const wineBinaries = [
+    path.join(app.getPath('appData'), 'SteamMacClient', 'WineCrossover', 'Wine Crossover.app', 'Contents', 'Resources', 'wine', 'bin', 'wineserver'),
+    path.join(app.getPath('appData'), 'SteamMacClient', 'WineStaging', 'Wine Staging.app', 'Contents', 'Resources', 'wine', 'bin', 'wineserver'),
+  ];
+
+  for (const wineserver of wineBinaries) {
+    if (!fs.existsSync(wineserver)) continue;
+    // List prefix directories and shut down each wineserver
+    try {
+      const entries = fs.readdirSync(prefixesDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const prefix = path.join(prefixesDir, entry.name);
+        try {
+          execFileSync(wineserver, ['-k'], {
+            stdio: 'ignore',
+            env: { ...process.env, WINEPREFIX: prefix },
+            timeout: 5000,
+          });
+        } catch {}
+      }
+    } catch {}
+  }
 });
