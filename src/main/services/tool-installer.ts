@@ -126,8 +126,14 @@ export async function installSingleTool(
   }
 
   if (identifier === 'gptk' || identifier === 'game-porting-toolkit') {
-    const brewPath = findBrew();
-    if (!brewPath) throw new Error('Homebrew not found.');
+    let brewPath = findBrew();
+    if (!brewPath) {
+      await onProgress('Installing Homebrew...', 0.1);
+      const ok = await installHomebrew(onLog);
+      if (!ok) throw new Error('Homebrew installation failed.');
+      brewPath = findBrew();
+    }
+    if (!brewPath) throw new Error('Could not locate Homebrew.');
     await onProgress('Installing Game Porting Toolkit...', 0.3);
     const ok = await installGPTK(brewPath, onLog);
     await onProgress(ok ? 'Done.' : 'Failed.', 1.0);
@@ -155,8 +161,14 @@ export async function installSingleTool(
     return ok;
   }
 
-  const brewPath = findBrew();
-  if (!brewPath) throw new Error('Homebrew not found.');
+  let brewPath = findBrew();
+  if (!brewPath) {
+    await onProgress('Installing Homebrew...', 0.1);
+    const ok = await installHomebrew(onLog);
+    if (!ok) throw new Error('Homebrew installation failed.');
+    brewPath = findBrew();
+  }
+  if (!brewPath) throw new Error('Could not locate Homebrew.');
 
   const isCask = identifier.includes('wine') || identifier === 'steamcmd';
 
@@ -175,8 +187,14 @@ export async function reinstallAll(
   onProgress: ProgressCallback,
   onLog: LogCallback,
 ): Promise<ToolStatus> {
-  const brewPath = findBrew();
-  if (!brewPath) throw new Error('Homebrew not found.');
+  let brewPath = findBrew();
+  if (!brewPath) {
+    await onProgress('Installing Homebrew...', 0.05);
+    const ok = await installHomebrew(onLog);
+    if (!ok) throw new Error('Homebrew installation failed.');
+    brewPath = findBrew();
+  }
+  if (!brewPath) throw new Error('Could not locate Homebrew.');
 
   // Remove DepotDownloader
   await onProgress('Removing DepotDownloader...', 0.05);
