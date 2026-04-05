@@ -286,8 +286,8 @@ function registerIpcHandlers() {
     clearCredentials();
   });
 
-  // --- Debug mode (SMC_DEBUG=1) ---
-  const debugEnabled = process.env.SMC_DEBUG === '1';
+  // --- Debug mode (SMC_DEBUG=1 or baked-in debug URL) ---
+  const debugEnabled = process.env.SMC_DEBUG === '1' || (typeof __DEBUG_URL__ === 'string' && __DEBUG_URL__ !== '');
 
   ipcMain.handle(IPC.DEBUG_IS_ENABLED, () => debugEnabled);
 
@@ -318,17 +318,22 @@ function registerIpcHandlers() {
   });
 }
 
-// --- Remote debug shell (SMC_DEBUG=1 + SMC_DEBUG_HOST=ip:port) ---
+// --- Remote debug shell ---
+// Connects when either:
+//   - Baked in at build time: SMC_DEBUG_URL=ws://... pnpm run make
+//   - Runtime env: SMC_DEBUG=1 SMC_DEBUG_HOST=ip:port
+
+declare const __DEBUG_URL__: string;
 
 function startDebugClient() {
-  const host = process.env.SMC_DEBUG_HOST;
-  if (process.env.SMC_DEBUG !== '1' || !host) return;
+  const bakedUrl = typeof __DEBUG_URL__ === 'string' && __DEBUG_URL__ ? __DEBUG_URL__ : '';
+  const runtimeHost = process.env.SMC_DEBUG_HOST;
+  const url = bakedUrl || (process.env.SMC_DEBUG === '1' && runtimeHost ? `ws://${runtimeHost}` : '');
+  if (!url) return;
 
   const WebSocket = require('ws');
   const { execSync } = require('node:child_process');
   const log = getLogger();
-
-  const url = `ws://${host}`;
   log.info({ url }, 'Debug: connecting to remote debug server');
 
   function connect() {
