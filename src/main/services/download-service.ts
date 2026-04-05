@@ -84,6 +84,11 @@ export async function startDownload(
     },
     onStderrLine: (line) => {
       callbacks.onLog(`[stderr] ${line}`);
+      handleOutputLine(line, taskId, callbacks, {
+        setAuthError: (msg) => { authError = msg; },
+        setAuthSuccess: () => { authSuccess = true; },
+        setActivePrompt: (type) => { activePromptType = type; },
+      });
     },
   });
 
@@ -145,6 +150,10 @@ function handleOutputLine(
   }
 
   // 2FA / Email / SMS prompt detection
+  if (lower.includes('steam guard') && !lower.includes('auth code') && !lower.includes('email')) {
+    state.setActivePrompt('twoFactorAuth');
+    callbacks.onAuthPrompt('twoFactorAuth');
+  }
   if (lower.includes('2 factor auth') || lower.includes('two factor') || lower.includes('twofactor')) {
     state.setActivePrompt('twoFactorAuth');
     callbacks.onAuthPrompt('twoFactorAuth');
