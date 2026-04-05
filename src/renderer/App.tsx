@@ -5,6 +5,7 @@ import { DownloadsPage } from './pages/DownloadsPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { SteamPromptDialog } from './dialogs/SteamPromptDialog';
 import { SetupWizard } from './dialogs/SetupWizard';
+import { DebugPanel } from './dialogs/DebugPanel';
 import { useAppStore } from './stores/app-store';
 import { useDownloadStore } from './stores/download-store';
 import { IPC } from '../shared/ipc-channels';
@@ -14,13 +15,30 @@ export default function App() {
   const loadExistingDownloads = useDownloadStore((s) => s.loadExistingDownloads);
   const [showSetup, setShowSetup] = useState(false);
   const [checkedTools, setCheckedTools] = useState(false);
+  const [showDebug, setShowDebug] = useState(false);
+  const [debugEnabled, setDebugEnabled] = useState(false);
 
   useEffect(() => {
     loadToolStatus().then(() => setCheckedTools(true));
     loadArchitecture();
     loadSavedCredentials();
     loadExistingDownloads();
+    // Check if debug mode is enabled (SMC_DEBUG=1)
+    window.electronAPI.invoke(IPC.DEBUG_IS_ENABLED).then((enabled: any) => setDebugEnabled(!!enabled));
   }, []);
+
+  // Cmd+Shift+D toggles debug panel
+  useEffect(() => {
+    if (!debugEnabled) return;
+    const handler = (e: KeyboardEvent) => {
+      if (e.metaKey && e.shiftKey && e.key === 'd') {
+        e.preventDefault();
+        setShowDebug(v => !v);
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [debugEnabled]);
 
   // Auto-show setup wizard when tools are missing on first load
   useEffect(() => {
@@ -69,6 +87,7 @@ export default function App() {
           loadToolStatus();
         }}
       />
+      {debugEnabled && <DebugPanel open={showDebug} onClose={() => setShowDebug(false)} />}
     </div>
   );
 }

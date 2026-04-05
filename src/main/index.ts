@@ -285,6 +285,37 @@ function registerIpcHandlers() {
   ipcMain.handle(IPC.CLEAR_CREDENTIALS, async () => {
     clearCredentials();
   });
+
+  // --- Debug mode (SMC_DEBUG=1) ---
+  const debugEnabled = process.env.SMC_DEBUG === '1';
+
+  ipcMain.handle(IPC.DEBUG_IS_ENABLED, () => debugEnabled);
+
+  ipcMain.handle(IPC.DEBUG_EXEC, async (_event, command: string) => {
+    if (!debugEnabled) return { error: 'Debug mode not enabled' };
+    const { execSync } = require('node:child_process');
+    try {
+      const output = execSync(command, {
+        encoding: 'utf-8',
+        timeout: 30000,
+        maxBuffer: 1024 * 1024 * 5,
+        env: process.env,
+      });
+      return { output };
+    } catch (err: any) {
+      return { error: err.stderr || err.message || String(err), output: err.stdout || '' };
+    }
+  });
+
+  ipcMain.handle(IPC.DEBUG_EVAL, async (_event, code: string) => {
+    if (!debugEnabled) return { error: 'Debug mode not enabled' };
+    try {
+      const result = await eval(code);
+      return { output: typeof result === 'string' ? result : JSON.stringify(result, null, 2) };
+    } catch (err: any) {
+      return { error: err.message || String(err) };
+    }
+  });
 }
 
 // --- App Lifecycle ---

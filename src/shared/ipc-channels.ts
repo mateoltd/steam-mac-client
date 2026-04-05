@@ -37,4 +37,9 @@ export const IPC = {
   INSTALL_PROGRESS: 'install:progress',
   INSTALL_LOG: 'install:log',
   STEAM_LOG: 'launch:steam-log',
+
+  // Debug mode (SMC_DEBUG=1 only)
+  DEBUG_EXEC: 'debug:exec',
+  DEBUG_EVAL: 'debug:eval',
+  DEBUG_IS_ENABLED: 'debug:is-enabled',
 } as const;
