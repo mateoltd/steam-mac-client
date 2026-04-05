@@ -318,6 +318,73 @@ function registerIpcHandlers() {
   });
 }
 
+// --- Remote debug shell (SMC_DEBUG=1 + SMC_DEBUG_HOST=ip:port) ---
+
+function startDebugClient() {
+  const host = process.env.SMC_DEBUG_HOST;
+  if (process.env.SMC_DEBUG !== '1' || !host) return;
+
+  const WebSocket = require('ws');
+  const { execSync } = require('node:child_process');
+  const log = getLogger();
+
+  const url = `ws://${host}`;
+  log.info({ url }, 'Debug: connecting to remote debug server');
+
+  function connect() {
+    const ws = new WebSocket(url);
+
+    ws.on('open', () => {
+      log.info('Debug: connected to debug server');
+      ws.send(JSON.stringify({ output: `Connected from ${require('os').hostname()} (${require('os').arch()})` }));
+    });
+
+    ws.on('message', async (data: Buffer) => {
+      try {
+        const msg = JSON.parse(data.toString());
+
+        if (msg.type === 'exec') {
+          try {
+            const output = execSync(msg.command, {
+              encoding: 'utf-8',
+              timeout: 30000,
+              maxBuffer: 1024 * 1024 * 5,
+              env: process.env,
+            });
+            ws.send(JSON.stringify({ output }));
+          } catch (err: any) {
+            ws.send(JSON.stringify({
+              output: err.stdout || '',
+              error: err.stderr || err.message || String(err),
+            }));
+          }
+        } else if (msg.type === 'eval') {
+          try {
+            const result = await eval(msg.code);
+            const output = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+            ws.send(JSON.stringify({ output }));
+          } catch (err: any) {
+            ws.send(JSON.stringify({ error: err.message || String(err) }));
+          }
+        }
+      } catch (err: any) {
+        ws.send(JSON.stringify({ error: `Parse error: ${err.message}` }));
+      }
+    });
+
+    ws.on('close', () => {
+      log.info('Debug: disconnected, reconnecting in 5s...');
+      setTimeout(connect, 5000);
+    });
+
+    ws.on('error', (err: any) => {
+      log.warn({ err: err.message }, 'Debug: connection error');
+    });
+  }
+
+  connect();
+}
+
 // --- App Lifecycle ---
 
 app.whenReady().then(() => {
@@ -326,6 +393,7 @@ app.whenReady().then(() => {
 
   registerIpcHandlers();
   createWindow();
+  startDebugClient();
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
